@@ -1,0 +1,46 @@
+﻿# Python
+__pycache__/
+*.py[cod]
+*.pyd
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+
+# Node.js
+node_modules/
+dist/
+.vite/
+
+# Generated video files
+video/source/*
+!video/source/.gitkeep
+video/hls/*
+!video/hls/.gitkeep
+
+# Generated datasets and experiments
+dataset/raw/*
+!dataset/raw/.gitkeep
+dataset/processed/*
+!dataset/processed/.gitkeep
+experiments/results/
+
+# Machine learning artifacts
+*.joblib
+*.pkl
+*.model
+
+# IDE and operating system
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
