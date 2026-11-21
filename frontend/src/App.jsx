@@ -4,6 +4,7 @@ import Hls from 'hls.js'
 import './App.css'
 
 const STREAM_URL = 'http://127.0.0.1:8000/hls/master.m3u8'
+const MAX_SEGMENT_SAMPLES = 10
 
 function formatTime(seconds) {
   if (!Number.isFinite(seconds)) return '00:00'
@@ -12,6 +13,20 @@ function formatTime(seconds) {
   const remainingSeconds = Math.floor(seconds % 60)
 
   return `${String(minutes).padStart(2, '0')}:${String(remainingSeconds).padStart(2, '0')}`
+}
+
+function formatMbps(value) {
+  return Number.isFinite(value) && value > 0
+    ? `${value.toFixed(2)} Mbps`
+    : '—'
+}
+
+function formatBytes(bytes) {
+  if (!Number.isFinite(bytes) || bytes <= 0) return '—'
+
+  return bytes >= 1024 * 1024
+    ? `${(bytes / (1024 * 1024)).toFixed(2)} MB`
+    : `${(bytes / 1024).toFixed(1)} KB`
 }
 
 function App() {
@@ -27,15 +42,44 @@ function App() {
   const [currentTime, setCurrentTime] = useState(0)
   const [duration, setDuration] = useState(0)
 
+  // Actual telemetry collected from HLS.js and the video element.
+  const [segmentSamples, setSegmentSamples] = useState([])
+  const [bufferSeconds, setBufferSeconds] = useState(0)
+
   useEffect(() => {
     const video = videoRef.current
     if (!video) return
 
     let hls = null
 
+    function updateBuffer() {
+      if (!video || video.buffered.length === 0) {
+        setBufferSeconds(0)
+        return
+      }
+
+      const playbackPosition = video.currentTime
+
+      for (let index = 0; index < video.buffered.length; index += 1) {
+        const rangeStart = video.buffered.start(index)
+        const rangeEnd = video.buffered.end(index)
+
+        if (
+          playbackPosition >= rangeStart &&
+          playbackPosition <= rangeEnd
+        ) {
+          setBufferSeconds(Math.max(0, rangeEnd - playbackPosition))
+          return
+        }
+      }
+
+      setBufferSeconds(0)
+    }
+
     const handlePlaying = () => {
       setPlaying(true)
       setStatus('Playing')
+      updateBuffer()
     }
 
     const handlePause = () => {
@@ -45,10 +89,16 @@ function App() {
 
     const handleWaiting = () => {
       setStatus('Buffering')
+      updateBuffer()
     }
 
     const handleTimeUpdate = () => {
       setCurrentTime(video.currentTime)
+      updateBuffer()
+    }
+
+    const handleProgress = () => {
+      updateBuffer()
     }
 
     const handleLoadedMetadata = () => {
@@ -58,12 +108,14 @@ function App() {
     const handleEnded = () => {
       setPlaying(false)
       setStatus('Finished')
+      updateBuffer()
     }
 
     video.addEventListener('playing', handlePlaying)
     video.addEventListener('pause', handlePause)
     video.addEventListener('waiting', handleWaiting)
     video.addEventListener('timeupdate', handleTimeUpdate)
+    video.addEventListener('progress', handleProgress)
     video.addEventListener('loadedmetadata', handleLoadedMetadata)
     video.addEventListener('ended', handleEnded)
 
@@ -98,12 +150,56 @@ function App() {
         }
       })
 
+      // Measure completed main/video fragment downloads.
+      hls.on(Hls.Events.FRAG_LOADED, (_, data) => {
+        const fragment = data.frag
+
+        // Ignore audio, subtitles, and initialization fragments.
+        if (fragment.type !== 'main' || fragment.sn === 'initSegment') {
+          return
+        }
+
+        const stats = fragment.stats
+        const downloadedBytes = stats.loaded
+        const downloadDurationMs = stats.loading.end - stats.loading.start
+
+        if (
+          stats.aborted ||
+          !Number.isFinite(downloadedBytes) ||
+          downloadedBytes <= 0 ||
+          !Number.isFinite(downloadDurationMs) ||
+          downloadDurationMs <= 0
+        ) {
+          return
+        }
+
+        // Bytes × 8 / milliseconds / 1000 = Mbps.
+        const throughputMbps =
+          (downloadedBytes * 8) / (downloadDurationMs * 1000)
+
+        const level = hls.levels[fragment.level]
+
+        const sample = {
+          id: `${fragment.level}-${fragment.sn}-${Date.now()}`,
+          quality: level ? `${level.height}p` : 'Unknown',
+          bytes: downloadedBytes,
+          durationSeconds: downloadDurationMs / 1000,
+          throughputMbps,
+        }
+
+        setSegmentSamples((previousSamples) =>
+          [sample, ...previousSamples].slice(0, MAX_SEGMENT_SAMPLES),
+        )
+      })
+
       hls.on(Hls.Events.ERROR, (_, data) => {
         if (data.fatal) {
           setStatus('Error')
 
           if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
-            setError('Network error while loading the video. Check that FastAPI is running.')
+            setError(
+              'Network error while loading the video. Check that FastAPI is running.',
+            )
             hls.startLoad()
           } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
             setError('Media playback error. Attempting recovery...')
@@ -130,6 +226,7 @@ function App() {
       video.removeEventListener('pause', handlePause)
       video.removeEventListener('waiting', handleWaiting)
       video.removeEventListener('timeupdate', handleTimeUpdate)
+      video.removeEventListener('progress', handleProgress)
       video.removeEventListener('loadedmetadata', handleLoadedMetadata)
       video.removeEventListener('ended', handleEnded)
 
@@ -147,7 +244,6 @@ function App() {
     setSelectedQuality(value)
 
     const hls = hlsRef.current
-
     if (!hls) return
 
     if (value === 'auto') {
@@ -160,6 +256,16 @@ function App() {
   const progress = duration > 0
     ? (currentTime / duration) * 100
     : 0
+
+  const currentThroughput = segmentSamples[0]?.throughputMbps
+  const previousThroughput = segmentSamples[1]?.throughputMbps
+
+  const averageThroughput = segmentSamples.length > 0
+    ? segmentSamples.reduce(
+        (total, sample) => total + sample.throughputMbps,
+        0,
+      ) / segmentSamples.length
+    : null
 
   return (
     <main className="dashboard">
@@ -312,13 +418,101 @@ function App() {
         </aside>
       </section>
 
+      <section className="main-grid">
+        <div className="information-panel">
+          <div className="panel-heading">
+            <div>
+              <h3>Network Monitoring</h3>
+              <p>Measurements from completed HLS video downloads</p>
+            </div>
+            <span className="stream-tag">LIVE DATA</span>
+          </div>
+
+          <div className="metric-card">
+            <span className="metric-label">LATEST SEGMENT THROUGHPUT</span>
+            <strong>{formatMbps(currentThroughput)}</strong>
+            <span className="metric-caption">
+              Effective throughput of the most recently downloaded video segment
+            </span>
+          </div>
+
+          <div className="metric-card">
+            <span className="metric-label">PREVIOUS SEGMENT THROUGHPUT</span>
+            <strong>{formatMbps(previousThroughput)}</strong>
+            <span className="metric-caption">
+              Throughput measured for the preceding video segment
+            </span>
+          </div>
+
+          <div className="metric-card">
+            <span className="metric-label">AVERAGE THROUGHPUT</span>
+            <strong>{formatMbps(averageThroughput)}</strong>
+            <span className="metric-caption">
+              Average of the latest {segmentSamples.length} recorded segment downloads
+            </span>
+          </div>
+
+          <div className="metric-card">
+            <span className="metric-label">PLAYBACK BUFFER</span>
+            <strong>
+              {segmentSamples.length > 0 || playing
+                ? `${bufferSeconds.toFixed(2)} sec`
+                : '—'}
+            </strong>
+            <span className="metric-caption">
+              Buffered video ahead of the current playback position
+            </span>
+          </div>
+        </div>
+
+        <div className="information-panel">
+          <div className="panel-heading">
+            <div>
+              <h3>Recent Segment Downloads</h3>
+              <p>Latest completed video fragment measurements</p>
+            </div>
+          </div>
+
+          {segmentSamples.length === 0 ? (
+            <p className="empty-state">
+              No segment measurements yet. Start video playback to collect data.
+            </p>
+          ) : (
+            <div className="quality-list">
+              {segmentSamples.map((sample, index) => (
+                <div className="quality-item" key={sample.id}>
+                  <span>
+                    {index === 0 ? 'Latest' : sample.quality}
+                    {index === 0 ? ` · ${sample.quality}` : ''}
+                  </span>
+                  <span>
+                    {formatMbps(sample.throughputMbps)}
+                    {' · '}
+                    {formatBytes(sample.bytes)}
+                    {' · '}
+                    {sample.durationSeconds.toFixed(2)} sec
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
+
+          <p className="metric-caption">
+            Measurements are collected from HLS.js completed main-fragment
+            download statistics. Native HLS playback does not expose these
+            HLS.js fragment events.
+          </p>
+        </div>
+      </section>
+
       <section className="bottom-note">
         <div className="note-icon">✓</div>
         <div>
           <strong>Real HLS stream connected</strong>
           <p>
-            Video playlists and segments are served by your FastAPI backend.
-            AI prediction and network monitoring will be integrated in later phases.
+            Segment throughput and playback buffer are measured from actual
+            playback activity. Predictive AI and network simulation will be
+            integrated in later phases.
           </p>
         </div>
       </section>
