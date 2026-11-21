@@ -29,6 +29,12 @@ function formatBytes(bytes) {
     : `${(bytes / 1024).toFixed(1)} KB`
 }
 
+function formatTtfb(value) {
+  return Number.isFinite(value) && value >= 0
+    ? `${value.toFixed(2)} ms`
+    : '—'
+}
+
 function App() {
   const videoRef = useRef(null)
   const hlsRef = useRef(null)
@@ -42,7 +48,6 @@ function App() {
   const [currentTime, setCurrentTime] = useState(0)
   const [duration, setDuration] = useState(0)
 
-  // Actual telemetry collected from HLS.js and the video element.
   const [segmentSamples, setSegmentSamples] = useState([])
   const [bufferSeconds, setBufferSeconds] = useState(0)
 
@@ -150,7 +155,7 @@ function App() {
         }
       })
 
-      // Measure completed main/video fragment downloads.
+      // Collect actual measurements from completed video fragments.
       hls.on(Hls.Events.FRAG_LOADED, (_, data) => {
         const fragment = data.frag
 
@@ -161,7 +166,8 @@ function App() {
 
         const stats = fragment.stats
         const downloadedBytes = stats.loaded
-        const downloadDurationMs = stats.loading.end - stats.loading.start
+        const downloadDurationMs =
+          stats.loading.end - stats.loading.start
 
         if (
           stats.aborted ||
@@ -173,9 +179,19 @@ function App() {
           return
         }
 
-        // Bytes × 8 / milliseconds / 1000 = Mbps.
         const throughputMbps =
           (downloadedBytes * 8) / (downloadDurationMs * 1000)
+
+        // HLS.js records the time when the first response data arrives.
+        // A zero or missing first timestamp is treated as unavailable.
+        const firstByteTime = stats.loading.first
+
+        const ttfbMs =
+          Number.isFinite(firstByteTime) &&
+          firstByteTime > 0 &&
+          firstByteTime >= stats.loading.start
+            ? firstByteTime - stats.loading.start
+            : null
 
         const level = hls.levels[fragment.level]
 
@@ -185,6 +201,7 @@ function App() {
           bytes: downloadedBytes,
           durationSeconds: downloadDurationMs / 1000,
           throughputMbps,
+          ttfbMs,
         }
 
         setSegmentSamples((previousSamples) =>
@@ -259,6 +276,7 @@ function App() {
 
   const currentThroughput = segmentSamples[0]?.throughputMbps
   const previousThroughput = segmentSamples[1]?.throughputMbps
+  const currentTtfb = segmentSamples[0]?.ttfbMs
 
   const averageThroughput = segmentSamples.length > 0
     ? segmentSamples.reduce(
@@ -266,6 +284,41 @@ function App() {
         0,
       ) / segmentSamples.length
     : null
+
+  // Compare the latest five downloads with the preceding five.
+  const throughputTrend = (() => {
+    if (segmentSamples.length < MAX_SEGMENT_SAMPLES) {
+      return null
+    }
+
+    const recentSamples = segmentSamples.slice(0, 5)
+    const previousSamples = segmentSamples.slice(5, 10)
+
+    const recentAverage = recentSamples.reduce(
+      (total, sample) => total + sample.throughputMbps,
+      0,
+    ) / recentSamples.length
+
+    const previousAverage = previousSamples.reduce(
+      (total, sample) => total + sample.throughputMbps,
+      0,
+    ) / previousSamples.length
+
+    if (previousAverage <= 0) return null
+
+    const changePercentage =
+      ((recentAverage - previousAverage) / previousAverage) * 100
+
+    if (changePercentage > 5) {
+      return `Increasing · ${changePercentage.toFixed(1)}%`
+    }
+
+    if (changePercentage < -5) {
+      return `Decreasing · ${Math.abs(changePercentage).toFixed(1)}%`
+    }
+
+    return `Stable · ${changePercentage.toFixed(1)}%`
+  })()
 
   return (
     <main className="dashboard">
@@ -453,6 +506,22 @@ function App() {
           </div>
 
           <div className="metric-card">
+            <span className="metric-label">REQUEST TO FIRST BYTE (TTFB)</span>
+            <strong>{formatTtfb(currentTtfb)}</strong>
+            <span className="metric-caption">
+              Time from segment request start to first response data
+            </span>
+          </div>
+
+          <div className="metric-card">
+            <span className="metric-label">THROUGHPUT TREND</span>
+            <strong>{throughputTrend || 'Collecting data'}</strong>
+            <span className="metric-caption">
+              Compares the latest five downloads with the preceding five
+            </span>
+          </div>
+
+          <div className="metric-card">
             <span className="metric-label">PLAYBACK BUFFER</span>
             <strong>
               {segmentSamples.length > 0 || playing
@@ -491,6 +560,8 @@ function App() {
                     {formatBytes(sample.bytes)}
                     {' · '}
                     {sample.durationSeconds.toFixed(2)} sec
+                    {' · TTFB '}
+                    {formatTtfb(sample.ttfbMs)}
                   </span>
                 </div>
               ))}
@@ -510,9 +581,9 @@ function App() {
         <div>
           <strong>Real HLS stream connected</strong>
           <p>
-            Segment throughput and playback buffer are measured from actual
-            playback activity. Predictive AI and network simulation will be
-            integrated in later phases.
+            Segment throughput, request-to-first-byte time and playback buffer
+            are measured from actual playback activity. Predictive AI and
+            network simulation will be integrated in later phases.
           </p>
         </div>
       </section>
