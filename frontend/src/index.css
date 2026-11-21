@@ -45,3 +45,67 @@ button {
   min-height: 100vh;
   width: 100%;
 }
+
+/* Network Simulation Panel */
+
+.simulation-panel {
+  margin-top: 22px;
+}
+
+.simulation-controls {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+}
+
+.simulation-control {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+}
+
+.simulation-control label {
+  color: #939bad;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 1px;
+}
+
+.simulation-control select {
+  width: 100%;
+  padding: 11px 12px;
+  border: 1px solid #3a4052;
+  border-radius: 7px;
+  background: #222738;
+  color: #f3f4f6;
+  font-size: 13px;
+  outline: none;
+}
+
+.simulation-control select:focus {
+  border-color: #8b7cff;
+}
+
+.simulation-control select:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.simulation-status {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 20px;
+  padding: 12px;
+  border: 1px solid #34384b;
+  border-radius: 8px;
+  background: #1d2231;
+  color: #c4cad6;
+  font-size: 12px;
+}
+
+@media (max-width: 550px) {
+  .simulation-controls {
+    grid-template-columns: 1fr;
+  }
+}

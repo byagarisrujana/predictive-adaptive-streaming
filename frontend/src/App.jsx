@@ -1,9 +1,10 @@
-
+﻿
 import { useEffect, useRef, useState } from 'react'
 import Hls from 'hls.js'
 import './App.css'
 
 const STREAM_URL = 'http://127.0.0.1:8000/hls/master.m3u8'
+const SIMULATOR_URL = 'http://127.0.0.1:8000/simulated-hls'
 const MAX_SEGMENT_SAMPLES = 10
 
 function formatTime(seconds) {
@@ -47,9 +48,16 @@ function App() {
   const [playing, setPlaying] = useState(false)
   const [currentTime, setCurrentTime] = useState(0)
   const [duration, setDuration] = useState(0)
-
   const [segmentSamples, setSegmentSamples] = useState([])
   const [bufferSeconds, setBufferSeconds] = useState(0)
+
+  // Network simulation settings
+  const [networkMode, setNetworkMode] = useState('normal')
+  const [simulatedBandwidth, setSimulatedBandwidth] = useState('1')
+
+  const streamUrl = networkMode === 'simulated'
+    ? `${SIMULATOR_URL}/${simulatedBandwidth}/master.m3u8`
+    : STREAM_URL
 
   useEffect(() => {
     const video = videoRef.current
@@ -57,8 +65,11 @@ function App() {
 
     let hls = null
 
+    setStatus('Connecting')
+    setError('')
+
     function updateBuffer() {
-      if (!video || video.buffered.length === 0) {
+      if (video.buffered.length === 0) {
         setBufferSeconds(0)
         return
       }
@@ -132,7 +143,7 @@ function App() {
       hlsRef.current = hls
 
       hls.on(Hls.Events.MEDIA_ATTACHED, () => {
-        hls.loadSource(STREAM_URL)
+        hls.loadSource(streamUrl)
       })
 
       hls.on(Hls.Events.MANIFEST_PARSED, () => {
@@ -155,7 +166,7 @@ function App() {
         }
       })
 
-      // Collect actual measurements from completed video fragments.
+      // Collect measurements from completed video fragments.
       hls.on(Hls.Events.FRAG_LOADED, (_, data) => {
         const fragment = data.frag
 
@@ -182,8 +193,6 @@ function App() {
         const throughputMbps =
           (downloadedBytes * 8) / (downloadDurationMs * 1000)
 
-        // HLS.js records the time when the first response data arrives.
-        // A zero or missing first timestamp is treated as unavailable.
         const firstByteTime = stats.loading.first
 
         const ttfbMs =
@@ -231,7 +240,7 @@ function App() {
 
       hls.attachMedia(video)
     } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-      video.src = STREAM_URL
+      video.src = streamUrl
       setStatus('Native HLS')
     } else {
       setStatus('Unsupported')
@@ -252,8 +261,34 @@ function App() {
       }
 
       hlsRef.current = null
+
+      video.pause()
+      video.removeAttribute('src')
+      video.load()
     }
-  }, [])
+  }, [streamUrl])
+
+  function resetMeasurements() {
+    setSegmentSamples([])
+    setBufferSeconds(0)
+    setCurrentTime(0)
+    setDuration(0)
+    setPlaying(false)
+    setLevels([])
+    setSelectedQuality('auto')
+    setActiveQuality('Detecting')
+    setError('')
+  }
+
+  function handleNetworkModeChange(event) {
+    resetMeasurements()
+    setNetworkMode(event.target.value)
+  }
+
+  function handleBandwidthChange(event) {
+    resetMeasurements()
+    setSimulatedBandwidth(event.target.value)
+  }
 
   function handleQualityChange(event) {
     const value = event.target.value
@@ -359,7 +394,6 @@ function App() {
               <h3>Video Player</h3>
               <p>Source: Generated HLS stream</p>
             </div>
-
             <span className="stream-tag">HLS</span>
           </div>
 
@@ -407,7 +441,6 @@ function App() {
                   disabled={levels.length === 0}
                 >
                   <option value="auto">Auto</option>
-
                   {levels.map((level) => (
                     <option key={level.index} value={String(level.index)}>
                       {level.height}p
@@ -456,7 +489,6 @@ function App() {
 
           <div className="quality-list">
             <h4>Available Resolutions</h4>
-
             {levels.length === 0 ? (
               <p className="empty-state">Waiting for playlist...</p>
             ) : (
@@ -469,6 +501,54 @@ function App() {
             )}
           </div>
         </aside>
+      </section>
+
+      {/* Network Simulation */}
+      <section className="information-panel simulation-panel">
+        <div className="panel-heading">
+          <div>
+            <h3>Network Simulation</h3>
+            <p>Test streaming under controlled bandwidth conditions</p>
+          </div>
+          <span className="stream-tag">EXPERIMENT</span>
+        </div>
+
+        <div className="simulation-controls">
+          <div className="simulation-control">
+            <label htmlFor="network-mode">NETWORK MODE</label>
+            <select
+              id="network-mode"
+              value={networkMode}
+              onChange={handleNetworkModeChange}
+            >
+              <option value="normal">Normal Network</option>
+              <option value="simulated">Simulated Network</option>
+            </select>
+          </div>
+
+          <div className="simulation-control">
+            <label htmlFor="bandwidth">SIMULATED BANDWIDTH</label>
+            <select
+              id="bandwidth"
+              value={simulatedBandwidth}
+              onChange={handleBandwidthChange}
+              disabled={networkMode !== 'simulated'}
+            >
+              <option value="0.5">0.5 Mbps</option>
+              <option value="1">1 Mbps</option>
+              <option value="2">2 Mbps</option>
+              <option value="5">5 Mbps</option>
+              <option value="10">10 Mbps</option>
+            </select>
+          </div>
+        </div>
+
+        <div className="simulation-status">
+          <span className={`status-dot ${networkMode === 'simulated' ? '' : 'idle'}`} />
+          {networkMode === 'simulated'
+            ? `Simulation active - ${simulatedBandwidth} Mbps configured`
+            : 'Normal streaming - No artificial bandwidth limit'}
+        </div>
       </section>
 
       <section className="main-grid">
@@ -582,8 +662,9 @@ function App() {
           <strong>Real HLS stream connected</strong>
           <p>
             Segment throughput, request-to-first-byte time and playback buffer
-            are measured from actual playback activity. Predictive AI and
-            network simulation will be integrated in later phases.
+            are measured from actual playback activity. Network simulation
+            controls the bandwidth of actual HLS segment downloads. Predictive
+            AI quality selection will be integrated in later phases.
           </p>
         </div>
       </section>
