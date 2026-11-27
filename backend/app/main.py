@@ -5,7 +5,9 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from streaming.simulator import router as simulator_router
-
+from database import initialize_database
+from routes.experiments import router as experiments_router
+from routes.predictions import router as predictions_router
 # Locate the project's generated HLS video directory.
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 HLS_DIRECTORY = PROJECT_ROOT / "video" / "hls"
@@ -15,6 +17,9 @@ app = FastAPI(
     description="Backend API for AI-based adaptive video streaming optimization.",
     version="1.0.0"
 )
+initialize_database()
+app.include_router(experiments_router)
+app.include_router(predictions_router)
 app.include_router(simulator_router, prefix="/simulated-hls")
 # Allow the React development server to communicate with FastAPI.
 app.add_middleware(

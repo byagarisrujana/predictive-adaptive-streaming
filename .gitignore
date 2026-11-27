@@ -44,3 +44,7 @@ Thumbs.db
 
 # Logs
 *.log
+# SQLite experiment database
+backend/data/*.db
+# Local experiment database
+/data/*.db

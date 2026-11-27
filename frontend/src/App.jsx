@@ -1,11 +1,14 @@
 ﻿
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import Hls from 'hls.js'
 import './App.css'
 
-const STREAM_URL = 'http://127.0.0.1:8000/hls/master.m3u8'
-const SIMULATOR_URL = 'http://127.0.0.1:8000/simulated-hls'
+const API_BASE_URL = 'http://127.0.0.1:8000'
+const STREAM_URL = `${API_BASE_URL}/hls/master.m3u8`
+const SIMULATOR_URL = `${API_BASE_URL}/simulated-hls`
 const MAX_SEGMENT_SAMPLES = 10
+const AI_SAFETY_MARGIN = 0.75
+const AI_UPGRADE_BUFFER_SECONDS = 8
 
 function formatTime(seconds) {
   if (!Number.isFinite(seconds)) return '00:00'
@@ -36,9 +39,41 @@ function formatTtfb(value) {
     : '—'
 }
 
+function getCurrentBufferSeconds(video) {
+  if (!video || video.buffered.length === 0) return 0
+
+  const playbackPosition = video.currentTime
+
+  for (let index = 0; index < video.buffered.length; index += 1) {
+    const rangeStart = video.buffered.start(index)
+    const rangeEnd = video.buffered.end(index)
+
+    if (
+      playbackPosition >= rangeStart &&
+      playbackPosition <= rangeEnd
+    ) {
+      return Math.max(0, rangeEnd - playbackPosition)
+    }
+  }
+
+  return 0
+}
+
 function App() {
   const videoRef = useRef(null)
   const hlsRef = useRef(null)
+  const activeExperimentRef = useRef(null)
+  const measurementQueueRef = useRef(Promise.resolve())
+  const stoppingExperimentRef = useRef(false)
+
+  const selectedQualityRef = useRef('auto')
+  const predictionRequestRef = useRef(false)
+  const predictionGenerationRef = useRef(0)
+
+  // Playback evaluation tracking.
+  const playbackStartedRef = useRef(false)
+  const rebufferingRef = useRef(null)
+  const lastQualityLevelRef = useRef(null)
 
   const [status, setStatus] = useState('Connecting')
   const [error, setError] = useState('')
@@ -51,13 +86,222 @@ function App() {
   const [segmentSamples, setSegmentSamples] = useState([])
   const [bufferSeconds, setBufferSeconds] = useState(0)
 
-  // Network simulation settings
+  // AI prediction state.
+  const [predictedThroughput, setPredictedThroughput] = useState(null)
+  const [predictionStatus, setPredictionStatus] = useState('Waiting for data')
+  const [predictionError, setPredictionError] = useState('')
+
+  // Network simulation settings.
   const [networkMode, setNetworkMode] = useState('normal')
   const [simulatedBandwidth, setSimulatedBandwidth] = useState('1')
 
+  // Experiment recording state.
+  const [activeExperimentId, setActiveExperimentId] = useState(null)
+  const [experimentBusy, setExperimentBusy] = useState(false)
+  const [experimentMessage, setExperimentMessage] = useState('')
+  const [experimentError, setExperimentError] = useState('')
+
+  const experimentActive = activeExperimentId !== null
+
   const streamUrl = networkMode === 'simulated'
     ? `${SIMULATOR_URL}/${simulatedBandwidth}/master.m3u8`
-    : STREAM_URL
+    : networkMode === 'dynamic' && activeExperimentId !== null
+      ? `${SIMULATOR_URL}/dynamic/experiment_${activeExperimentId}/master.m3u8`
+      : STREAM_URL
+
+  // Queue experiment API requests so that stopping an experiment
+  // waits for all pending measurements and metric updates.
+  const queueExperimentRequest = useCallback((
+    experimentId,
+    endpoint,
+    payload = null,
+  ) => {
+    measurementQueueRef.current = measurementQueueRef.current
+      .then(async () => {
+        const options = {
+          method: 'POST',
+        }
+
+        if (payload !== null) {
+          options.headers = {
+            'Content-Type': 'application/json',
+          }
+          options.body = JSON.stringify(payload)
+        }
+
+        const response = await fetch(
+          `${API_BASE_URL}/experiments/${experimentId}/${endpoint}`,
+          options,
+        )
+
+        const result = await response.json().catch(() => null)
+
+        if (!response.ok) {
+          throw new Error(
+            result?.detail || `Experiment request failed: HTTP ${response.status}`,
+          )
+        }
+      })
+      .catch((uploadError) => {
+        console.error(uploadError)
+        setExperimentError(
+          'An experiment metric could not be saved. Check the backend connection.',
+        )
+      })
+  }, [])
+
+  // Finish an active buffering interruption and queue its duration.
+  const finishRebuffering = useCallback(() => {
+    const rebuffering = rebufferingRef.current
+
+    if (!rebuffering) return
+
+    rebufferingRef.current = null
+
+    const durationSeconds =
+      (Date.now() - rebuffering.startedAt) / 1000
+
+    if (
+      durationSeconds > 0 &&
+      rebuffering.experimentId !== null
+    ) {
+      queueExperimentRequest(
+        rebuffering.experimentId,
+        'rebuffering',
+        {
+          duration_seconds: durationSeconds,
+        },
+      )
+    }
+  }, [queueExperimentRequest])
+
+  // Select a quality level using predicted throughput and buffer conditions.
+  const applyAiQuality = useCallback((prediction, currentBuffer) => {
+    const hls = hlsRef.current
+
+    if (
+      !hls ||
+      selectedQualityRef.current !== 'ai' ||
+      !Number.isFinite(prediction) ||
+      prediction <= 0 ||
+      hls.levels.length === 0
+    ) {
+      return
+    }
+
+    const safetyMargin = currentBuffer < 3
+      ? 0.50
+      : currentBuffer < 8
+        ? 0.60
+        : AI_SAFETY_MARGIN
+
+    const safeBandwidth = prediction * safetyMargin
+
+    let targetLevel = 0
+
+    hls.levels.forEach((level, index) => {
+      const bitrateMbps = level.bitrate / 1000000
+
+      if (bitrateMbps <= safeBandwidth) {
+        targetLevel = index
+      }
+    })
+
+    const currentLevel = hls.currentLevel >= 0
+      ? hls.currentLevel
+      : hls.loadLevel
+
+    if (
+      currentLevel >= 0 &&
+      targetLevel > currentLevel &&
+      currentBuffer < AI_UPGRADE_BUFFER_SECONDS
+    ) {
+      return
+    }
+
+    if (currentLevel !== targetLevel) {
+      hls.currentLevel = targetLevel
+    }
+  }, [])
+
+  // Request a five-second-ahead throughput prediction from FastAPI.
+  const requestThroughputPrediction = useCallback(async (
+    sample,
+    currentBuffer,
+    qualityHeight,
+  ) => {
+    if (predictionRequestRef.current) return
+
+    if (
+      !Number.isFinite(sample.throughputMbps) ||
+      sample.throughputMbps <= 0 ||
+      !Number.isFinite(sample.durationSeconds) ||
+      sample.durationSeconds <= 0 ||
+      !Number.isFinite(sample.ttfbMs) ||
+      sample.ttfbMs < 0 ||
+      !Number.isFinite(currentBuffer) ||
+      currentBuffer < 0 ||
+      !Number.isFinite(qualityHeight) ||
+      qualityHeight <= 0
+    ) {
+      return
+    }
+
+    predictionRequestRef.current = true
+    const requestGeneration = predictionGenerationRef.current
+
+    setPredictionStatus('Predicting...')
+    setPredictionError('')
+
+    try {
+      const response = await fetch(`${API_BASE_URL}/predictions/throughput`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          throughput_mbps_current: sample.throughputMbps,
+          download_duration_seconds_current: sample.durationSeconds,
+          ttfb_ms_current: sample.ttfbMs,
+          buffer_seconds_current: currentBuffer,
+          quality_height_current: qualityHeight,
+        }),
+      })
+
+      if (!response.ok) {
+        throw new Error(`Prediction API returned HTTP ${response.status}`)
+      }
+
+      const result = await response.json()
+
+      if (
+        !Number.isFinite(result.predicted_throughput_mbps) ||
+        result.predicted_throughput_mbps <= 0
+      ) {
+        throw new Error('The prediction API returned an invalid value.')
+      }
+
+      if (requestGeneration !== predictionGenerationRef.current) {
+        return
+      }
+
+      setPredictedThroughput(result.predicted_throughput_mbps)
+      setPredictionStatus('Prediction ready')
+
+      if (selectedQualityRef.current === 'ai') {
+        applyAiQuality(result.predicted_throughput_mbps, currentBuffer)
+      }
+    } catch (predictionRequestError) {
+      if (requestGeneration === predictionGenerationRef.current) {
+        setPredictionStatus('Prediction unavailable')
+        setPredictionError(predictionRequestError.message)
+      }
+    } finally {
+      if (requestGeneration === predictionGenerationRef.current) {
+        predictionRequestRef.current = false
+      }
+    }
+  }, [applyAiQuality])
 
   useEffect(() => {
     const video = videoRef.current
@@ -69,30 +313,14 @@ function App() {
     setError('')
 
     function updateBuffer() {
-      if (video.buffered.length === 0) {
-        setBufferSeconds(0)
-        return
-      }
-
-      const playbackPosition = video.currentTime
-
-      for (let index = 0; index < video.buffered.length; index += 1) {
-        const rangeStart = video.buffered.start(index)
-        const rangeEnd = video.buffered.end(index)
-
-        if (
-          playbackPosition >= rangeStart &&
-          playbackPosition <= rangeEnd
-        ) {
-          setBufferSeconds(Math.max(0, rangeEnd - playbackPosition))
-          return
-        }
-      }
-
-      setBufferSeconds(0)
+      setBufferSeconds(getCurrentBufferSeconds(video))
     }
 
     const handlePlaying = () => {
+      // A playing event ends any previously recorded buffering interruption.
+      finishRebuffering()
+
+      playbackStartedRef.current = true
       setPlaying(true)
       setStatus('Playing')
       updateBuffer()
@@ -106,6 +334,23 @@ function App() {
     const handleWaiting = () => {
       setStatus('Buffering')
       updateBuffer()
+
+      // Ignore initial startup buffering. Count interruptions only
+      // after playback has successfully started.
+      if (
+        playbackStartedRef.current &&
+        !rebufferingRef.current
+      ) {
+        const activeExperiment = activeExperimentRef.current
+
+        rebufferingRef.current = {
+          startedAt: Date.now(),
+          experimentId:
+            activeExperiment && !stoppingExperimentRef.current
+              ? activeExperiment.id
+              : null,
+        }
+      }
     }
 
     const handleTimeUpdate = () => {
@@ -122,6 +367,7 @@ function App() {
     }
 
     const handleEnded = () => {
+      finishRebuffering()
       setPlaying(false)
       setStatus('Finished')
       updateBuffer()
@@ -156,6 +402,7 @@ function App() {
         setLevels(availableLevels)
         setStatus('Ready')
         setError('')
+        lastQualityLevelRef.current = null
       })
 
       hls.on(Hls.Events.LEVEL_SWITCHED, (_, data) => {
@@ -163,6 +410,28 @@ function App() {
 
         if (level) {
           setActiveQuality(`${level.height}p`)
+
+          // The first selected level is not counted as a switch.
+          const previousLevel = lastQualityLevelRef.current
+
+          if (
+            previousLevel !== null &&
+            previousLevel !== data.level
+          ) {
+            const activeExperiment = activeExperimentRef.current
+
+            if (
+              activeExperiment &&
+              !stoppingExperimentRef.current
+            ) {
+              queueExperimentRequest(
+                activeExperiment.id,
+                'quality-switch',
+              )
+            }
+          }
+
+          lastQualityLevelRef.current = data.level
         }
       })
 
@@ -170,7 +439,6 @@ function App() {
       hls.on(Hls.Events.FRAG_LOADED, (_, data) => {
         const fragment = data.frag
 
-        // Ignore audio, subtitles, and initialization fragments.
         if (fragment.type !== 'main' || fragment.sn === 'initSegment') {
           return
         }
@@ -203,6 +471,9 @@ function App() {
             : null
 
         const level = hls.levels[fragment.level]
+        const videoElement = videoRef.current
+        const observedAt = new Date().toISOString()
+        const currentBuffer = getCurrentBufferSeconds(videoElement)
 
         const sample = {
           id: `${fragment.level}-${fragment.sn}-${Date.now()}`,
@@ -213,9 +484,37 @@ function App() {
           ttfbMs,
         }
 
+        void requestThroughputPrediction(
+          sample,
+          currentBuffer,
+          level?.height,
+        )
+
         setSegmentSamples((previousSamples) =>
           [sample, ...previousSamples].slice(0, MAX_SEGMENT_SAMPLES),
         )
+
+        const activeExperiment = activeExperimentRef.current
+
+        if (activeExperiment && !stoppingExperimentRef.current) {
+          const measurement = {
+            observed_at: observedAt,
+            segment_number: String(fragment.sn),
+            quality_height: level?.height ?? null,
+            bytes_downloaded: downloadedBytes,
+            download_duration_seconds: downloadDurationMs / 1000,
+            throughput_mbps: throughputMbps,
+            ttfb_ms: ttfbMs,
+            buffer_seconds: currentBuffer,
+            playback_position_seconds: videoElement?.currentTime ?? 0,
+          }
+
+          queueExperimentRequest(
+            activeExperiment.id,
+            'measurements',
+            measurement,
+          )
+        }
       })
 
       hls.on(Hls.Events.ERROR, (_, data) => {
@@ -266,40 +565,216 @@ function App() {
       video.removeAttribute('src')
       video.load()
     }
-  }, [streamUrl])
+  }, [
+    streamUrl,
+    requestThroughputPrediction,
+    finishRebuffering,
+    queueExperimentRequest,
+  ])
 
   function resetMeasurements() {
+    predictionGenerationRef.current += 1
+    predictionRequestRef.current = false
+
+    playbackStartedRef.current = false
+    rebufferingRef.current = null
+    lastQualityLevelRef.current = null
+
     setSegmentSamples([])
     setBufferSeconds(0)
+    setPredictedThroughput(null)
+    setPredictionStatus('Waiting for data')
+    setPredictionError('')
     setCurrentTime(0)
     setDuration(0)
     setPlaying(false)
     setLevels([])
     setSelectedQuality('auto')
+    selectedQualityRef.current = 'auto'
     setActiveQuality('Detecting')
     setError('')
   }
 
   function handleNetworkModeChange(event) {
+    if (experimentActive || experimentBusy) return
+
     resetMeasurements()
     setNetworkMode(event.target.value)
   }
 
   function handleBandwidthChange(event) {
+    if (experimentActive || experimentBusy) return
+
     resetMeasurements()
     setSimulatedBandwidth(event.target.value)
   }
 
+  async function handleStartExperiment() {
+    if (activeExperimentRef.current || experimentBusy) return
+
+    setExperimentBusy(true)
+    setExperimentError('')
+    setExperimentMessage('Starting experiment...')
+
+    const algorithm = selectedQualityRef.current === 'ai'
+      ? 'ai'
+      : selectedQualityRef.current === 'auto'
+        ? 'hls_auto'
+        : 'manual'
+
+    const experimentDetails = {
+      network_mode: networkMode,
+      algorithm,
+      configured_bandwidth_mbps:
+        networkMode === 'simulated'
+          ? Number(simulatedBandwidth)
+          : null,
+    }
+
+    try {
+      const response = await fetch(`${API_BASE_URL}/experiments`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(experimentDetails),
+      })
+
+      const result = await response.json()
+
+      if (!response.ok) {
+        throw new Error(
+          result.detail || 'Could not start the experiment.',
+        )
+      }
+
+      if (networkMode === 'dynamic') {
+        const scenarioId = `experiment_${result.experiment_id}`
+
+        const scheduleResponse = await fetch(
+          `${API_BASE_URL}/simulated-hls/dynamic/${scenarioId}/schedule`,
+          {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+              schedule: [
+                { end_time_seconds: 8, bandwidth_mbps: 2.0 },
+                { end_time_seconds: 18, bandwidth_mbps: 0.5 },
+                { end_time_seconds: 24, bandwidth_mbps: 5.0 },
+                { end_time_seconds: 40, bandwidth_mbps: 1.0 },
+              ],
+            }),
+          },
+        )
+
+        const scheduleResult = await scheduleResponse.json()
+
+        if (!scheduleResponse.ok) {
+          throw new Error(
+            scheduleResult.detail || 'Could not configure the dynamic schedule.',
+          )
+        }
+      }
+
+      activeExperimentRef.current = {
+        id: result.experiment_id,
+      }
+
+      measurementQueueRef.current = Promise.resolve()
+      stoppingExperimentRef.current = false
+      rebufferingRef.current = null
+      lastQualityLevelRef.current = null
+
+      setActiveExperimentId(result.experiment_id)
+      setExperimentMessage(
+        `Recording experiment #${result.experiment_id} (${algorithm}). Play the video to collect measurements.`,
+      )
+    } catch (startError) {
+      console.error(startError)
+      setExperimentError(startError.message)
+      setExperimentMessage('')
+    } finally {
+      setExperimentBusy(false)
+    }
+  }
+
+  async function handleStopExperiment() {
+    const activeExperiment = activeExperimentRef.current
+
+    if (!activeExperiment || experimentBusy) return
+
+    setExperimentBusy(true)
+    setExperimentError('')
+    setExperimentMessage('Finishing pending measurement uploads...')
+
+    // Close and record a buffering interruption if one is still active.
+    finishRebuffering()
+
+    stoppingExperimentRef.current = true
+
+    try {
+      await measurementQueueRef.current
+
+      setExperimentMessage('Stopping experiment...')
+
+      const response = await fetch(
+        `${API_BASE_URL}/experiments/${activeExperiment.id}/stop`,
+        {
+          method: 'POST',
+        },
+      )
+
+      const result = await response.json()
+
+      if (!response.ok) {
+        throw new Error(
+          result.detail || 'Could not stop the experiment.',
+        )
+      }
+
+      activeExperimentRef.current = null
+      stoppingExperimentRef.current = false
+      rebufferingRef.current = null
+      lastQualityLevelRef.current = null
+
+      setActiveExperimentId(null)
+      setExperimentMessage(
+        `Experiment #${activeExperiment.id} stopped successfully.`,
+      )
+    } catch (stopError) {
+      console.error(stopError)
+
+      stoppingExperimentRef.current = false
+      setExperimentError(stopError.message)
+      setExperimentMessage(
+        `Experiment #${activeExperiment.id} is still active.`,
+      )
+    } finally {
+      setExperimentBusy(false)
+    }
+  }
+
   function handleQualityChange(event) {
+    if (experimentActive || experimentBusy) return
+
     const value = event.target.value
 
     setSelectedQuality(value)
+    selectedQualityRef.current = value
 
     const hls = hlsRef.current
     if (!hls) return
 
     if (value === 'auto') {
       hls.currentLevel = -1
+    } else if (value === 'ai') {
+      hls.currentLevel = -1
+
+      if (predictedThroughput !== null) {
+        applyAiQuality(predictedThroughput, bufferSeconds)
+      }
     } else {
       hls.currentLevel = Number(value)
     }
@@ -320,7 +795,6 @@ function App() {
       ) / segmentSamples.length
     : null
 
-  // Compare the latest five downloads with the preceding five.
   const throughputTrend = (() => {
     if (segmentSamples.length < MAX_SEGMENT_SAMPLES) {
       return null
@@ -438,9 +912,14 @@ function App() {
                   id="quality"
                   value={selectedQuality}
                   onChange={handleQualityChange}
-                  disabled={levels.length === 0}
+                  disabled={
+                    levels.length === 0 ||
+                    experimentActive ||
+                    experimentBusy
+                  }
                 >
                   <option value="auto">Auto</option>
+                  <option value="ai">AI Smart Auto</option>
                   {levels.map((level) => (
                     <option key={level.index} value={String(level.index)}>
                       {level.height}p
@@ -471,11 +950,19 @@ function App() {
 
           <div className="metric-card">
             <span className="metric-label">PLAYBACK MODE</span>
-            <strong>{selectedQuality === 'auto' ? 'Automatic' : 'Manual'}</strong>
+            <strong>
+              {selectedQuality === 'ai'
+                ? 'AI Smart Auto'
+                : selectedQuality === 'auto'
+                  ? 'Automatic'
+                  : 'Manual'}
+            </strong>
             <span className="metric-caption">
-              {selectedQuality === 'auto'
-                ? 'HLS.js adaptive quality selection'
-                : 'User-selected quality level'}
+              {selectedQuality === 'ai'
+                ? 'Quality selected using predicted throughput and buffer'
+                : selectedQuality === 'auto'
+                  ? 'HLS.js adaptive quality selection'
+                  : 'User-selected quality level'}
             </span>
           </div>
 
@@ -503,7 +990,6 @@ function App() {
         </aside>
       </section>
 
-      {/* Network Simulation */}
       <section className="information-panel simulation-panel">
         <div className="panel-heading">
           <div>
@@ -520,9 +1006,11 @@ function App() {
               id="network-mode"
               value={networkMode}
               onChange={handleNetworkModeChange}
+              disabled={experimentActive || experimentBusy}
             >
               <option value="normal">Normal Network</option>
               <option value="simulated">Simulated Network</option>
+              <option value="dynamic">Dynamic Network (Scheduled)</option>
             </select>
           </div>
 
@@ -532,7 +1020,11 @@ function App() {
               id="bandwidth"
               value={simulatedBandwidth}
               onChange={handleBandwidthChange}
-              disabled={networkMode !== 'simulated'}
+              disabled={
+                networkMode !== 'simulated' ||
+                experimentActive ||
+                experimentBusy
+              }
             >
               <option value="0.5">0.5 Mbps</option>
               <option value="1">1 Mbps</option>
@@ -544,10 +1036,51 @@ function App() {
         </div>
 
         <div className="simulation-status">
-          <span className={`status-dot ${networkMode === 'simulated' ? '' : 'idle'}`} />
-          {networkMode === 'simulated'
-            ? `Simulation active - ${simulatedBandwidth} Mbps configured`
-            : 'Normal streaming - No artificial bandwidth limit'}
+          <span className={`status-dot ${
+            networkMode === 'simulated' || networkMode === 'dynamic'
+              ? ''
+              : 'idle'
+          }`} />
+          {networkMode === 'dynamic'
+            ? 'Dynamic simulation active - 2 → 0.5 → 5 → 1 Mbps schedule'
+            : networkMode === 'simulated'
+              ? `Simulation active - ${simulatedBandwidth} Mbps configured`
+              : 'Normal streaming - No artificial bandwidth limit'}
+        </div>
+
+        <div className="experiment-controls">
+          <button
+            type="button"
+            className="experiment-button start-experiment-button"
+            onClick={handleStartExperiment}
+            disabled={experimentActive || experimentBusy}
+          >
+            Start Experiment
+          </button>
+
+          <button
+            type="button"
+            className="experiment-button stop-experiment-button"
+            onClick={handleStopExperiment}
+            disabled={!experimentActive || experimentBusy}
+          >
+            Stop Experiment
+          </button>
+        </div>
+
+        <div className="experiment-information">
+          <p>
+            <strong>Experiment ID:</strong>{' '}
+            {activeExperimentId ?? 'No active experiment'}
+          </p>
+
+          {experimentMessage && (
+            <p className="experiment-message">{experimentMessage}</p>
+          )}
+
+          {experimentError && (
+            <p className="experiment-error">{experimentError}</p>
+          )}
         </div>
       </section>
 
@@ -612,6 +1145,20 @@ function App() {
               Buffered video ahead of the current playback position
             </span>
           </div>
+
+          <div className="metric-card">
+            <span className="metric-label">AI PREDICTED THROUGHPUT</span>
+            <strong>{formatMbps(predictedThroughput)}</strong>
+            <span className="metric-caption">
+              Estimated network throughput approximately 5 seconds ahead
+            </span>
+            <span className="metric-caption">
+              {predictionStatus}
+            </span>
+            {predictionError && (
+              <span className="experiment-error">{predictionError}</span>
+            )}
+          </div>
         </div>
 
         <div className="information-panel">
@@ -659,12 +1206,13 @@ function App() {
       <section className="bottom-note">
         <div className="note-icon">✓</div>
         <div>
-          <strong>Real HLS stream connected</strong>
+          <strong>AI prediction and quality selection integrated</strong>
           <p>
-            Segment throughput, request-to-first-byte time and playback buffer
-            are measured from actual playback activity. Network simulation
-            controls the bandwidth of actual HLS segment downloads. Predictive
-            AI quality selection will be integrated in later phases.
+            The trained Linear Regression model predicts throughput using
+            actual segment measurements. AI Smart Auto uses the prediction,
+            available stream bitrates, and playback buffer to select a
+            resolution with a conservative bandwidth margin. HLS.js Auto
+            and manual quality selection remain available for comparison.
           </p>
         </div>
       </section>
